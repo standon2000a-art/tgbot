@@ -6,8 +6,17 @@ import os
 import subprocess
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    FSInputFile,
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -16,7 +25,11 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN topilmadi! Render Environment Variables bo'limiga BOT_TOKEN qo'shilganini tekshiring.")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+# Video qirqish holati uchun FSM
+class CutState(StatesGroup):
+    waiting_for_time = State()
 
 ydl_info_opts = {
     'quiet': True,
@@ -28,211 +41,53 @@ def get_video_info(url: str):
     with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
+def get_action_keyboard() -> InlineKeyboardMarkup:
+    """Video tagidagi boshqaruv tugmalari"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Aylana video", callback_data="round_btn"),
+                InlineKeyboardButton(text="🎵 MP3 Audio", callback_data="audio_btn"),
+            ],
+            [
+                InlineKeyboardButton(text="✂️ Qirqish (Cut)", callback_data="cut_btn"),
+                InlineKeyboardButton(text="🖼 Muqova (Thumb)", callback_data="thumb_btn"),
+            ],
+            [
+                InlineKeyboardButton(text="📝 Tavsif / Matn", callback_data="text_btn")
+            ]
+        ]
+    )
+
 # ---------------------------------------------------------
 # 1. START
 # ---------------------------------------------------------
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
-    text = (
+    await message.reply(
         "⚡️ <b>FlashFeatures Bot</b>'ga xush kelibsiz!\n\n"
-        "<b>Qanday ishlatiladi?</b>\n"
-        "1. Menga Instagram yoki YouTube linkini yuboring.\n"
-        "2. Men videoni chiqarib berganimdan so'ng, unga <b>Reply (Javob)</b> qilib buyruq bering:\n\n"
-        "🔄 <code>/round</code> — Aylana video (Video note) qilish\n"
-        "🎵 <code>/audio</code> — MP3 qilib ajratish\n"
-        "✂️ <code>/cut 00:05 00:20</code> — Kerakli qismini qirqish\n\n"
-        "<i>Eslatma: link orqali to'g'ridan-to'g'ri <code>/thumb [link]</code> yoki <code>/text [link]</code> qilish ham mumkin.</i>"
+        "Menga Instagram yoki YouTube havolasini yuboring. Video yuklangach, uning tagidagi tugmalar orqali barcha amallarni bir zumda bajarasiz!",
+        parse_mode="HTML"
     )
-    await message.reply(text, parse_mode="HTML")
 
 # ---------------------------------------------------------
-# 2. YORDAMCHI: Video faylni olish (Reply orqali yoki Link orqali)
-# ---------------------------------------------------------
-async def get_source_video(message: Message, target_path: str):
-    """Xabar reply qilingan videodan yoki linkdan faylni oladi"""
-    # 1-holat: Agar videoga Reply qilingan bo'lsa
-    if message.reply_to_message and message.reply_to_message.video:
-        file_id = message.reply_to_message.video.file_id
-        file = await bot.get_file(file_id)
-        await bot.download_file(file.file_path, target_path)
-        return True
-    
-    # 2-holat: Agar link matnda yozilgan bo'lsa
-    parts = message.text.split()
-    url = None
-    for part in parts:
-        if part.startswith("http://") or part.startswith("https://"):
-            url = part
-            break
-            
-    if url:
-        ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': target_path, 'quiet': True}
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).download([url]))
-        return True
-        
-    return False
-
-# ---------------------------------------------------------
-# 3. /round - AYLANA VIDEO (Reply orqali)
-# ---------------------------------------------------------
-@dp.message(Command("round"))
-async def round_video_cmd(message: Message):
-    status_msg = await message.reply("🔄 Aylana video tayyorlanmoqda...")
-    uid = message.from_user.id
-    raw_video = f"raw_round_{uid}.mp4"
-    round_video = f"round_{uid}.mp4"
-    
-    try:
-        success = await get_source_video(message, raw_video)
-        if not success or not os.path.exists(raw_video):
-            return await status_msg.edit_text("Videoni topib bo'lmadi! Videoga <b>Reply</b> qilib <code>/round</code> deb yozing yoki linkni qo'shib yuboring.", parse_mode="HTML")
-        
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', raw_video, '-t', '60',
-            '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=480:480",
-            '-c:v', 'libx264', '-c:a', 'aac', round_video
-        ]
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        
-        if os.path.exists(round_video):
-            await message.reply_video_note(video_note=FSInputFile(round_video))
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text("Aylana video yasashda xatolik yuz berdi.")
-    except Exception as e:
-        await status_msg.edit_text(f"Xatolik: {e}")
-    finally:
-        for f in [raw_video, round_video]:
-            if os.path.exists(f):
-                os.remove(f)
-
-# ---------------------------------------------------------
-# 4. /audio - MP3 AJRATISH (Reply orqali)
-# ---------------------------------------------------------
-@dp.message(Command("audio"))
-async def audio_video_cmd(message: Message):
-    status_msg = await message.reply("🎵 Audio ajratib olinmoqda...")
-    uid = message.from_user.id
-    raw_video = f"raw_audio_{uid}.mp4"
-    audio_file = f"audio_{uid}.mp3"
-    
-    try:
-        success = await get_source_video(message, raw_video)
-        if not success or not os.path.exists(raw_video):
-            return await status_msg.edit_text("Videoni topib bo'lmadi! Videoga <b>Reply</b> qilib <code>/audio</code> deb yozing.", parse_mode="HTML")
-            
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', raw_video,
-            '-vn', '-acodec', 'libmp3lame', '-q:a', '2', audio_file
-        ]
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        
-        if os.path.exists(audio_file):
-            await message.reply_audio(audio=FSInputFile(audio_file))
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text("Audioni chiqarib bo'lmadi.")
-    except Exception as e:
-        await status_msg.edit_text(f"Xatolik: {e}")
-    finally:
-        for f in [raw_video, audio_file]:
-            if os.path.exists(f):
-                os.remove(f)
-
-# ---------------------------------------------------------
-# 5. /cut - KESISH (Reply orqali: /cut 00:05 00:15)
-# ---------------------------------------------------------
-@dp.message(Command("cut"))
-async def cut_video_cmd(message: Message):
-    parts = message.text.split()
-    if len(parts) < 3:
-        return await message.reply("Format: Videoga reply qilib <code>/cut 00:05 00:20</code> yozing.", parse_mode="HTML")
-    
-    start_time, end_time = parts[1].strip(), parts[2].strip()
-    status_msg = await message.reply(f"✂️ Video {start_time} dan {end_time} gacha kesilmoqda...")
-    
-    uid = message.from_user.id
-    raw_video = f"raw_cut_{uid}.mp4"
-    cut_video = f"cut_{uid}.mp4"
-    
-    try:
-        success = await get_source_video(message, raw_video)
-        if not success or not os.path.exists(raw_video):
-            return await status_msg.edit_text("Videoni topib bo'lmadi! Videoga reply qiling.")
-            
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-ss', start_time, '-to', end_time,
-            '-i', raw_video, '-c', 'copy', cut_video
-        ]
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        
-        if os.path.exists(cut_video):
-            await message.reply_video(video=FSInputFile(cut_video))
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text("Videoni kesib bo'lmadi.")
-    except Exception as e:
-        await status_msg.edit_text(f"Xatolik: {e}")
-    finally:
-        for f in [raw_video, cut_video]:
-            if os.path.exists(f):
-                os.remove(f)
-
-# ---------------------------------------------------------
-# 6. /thumb va /text (Link orqali)
-# ---------------------------------------------------------
-@dp.message(Command("text"))
-async def get_text_cmd(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply("Format: /text <link>")
-    url = parts[1].strip()
-    status_msg = await message.reply("📝 Matn o'qilmoqda...")
-    try:
-        loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_video_info, url)
-        await status_msg.edit_text(info.get('description', 'Tavsif topilmadi.')[:4000])
-    except Exception:
-        await status_msg.edit_text("Xatolik: Matnni olib bo'lmadi.")
-
-@dp.message(Command("thumb"))
-async def get_thumb_cmd(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply("Format: /thumb <link>")
-    url = parts[1].strip()
-    status_msg = await message.reply("🖼 Muqova qidirilmoqda...")
-    try:
-        loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_video_info, url)
-        thumb = info.get('thumbnail')
-        if thumb:
-            await message.reply_photo(photo=thumb)
-            await status_msg.delete()
-        else:
-            await status_msg.edit_text("Muqova topilmadi.")
-    except Exception:
-        await status_msg.edit_text("Xatolik: Rasmni yuklab bo'lmadi.")
-
-# ---------------------------------------------------------
-# 7. ASOSIY QADAM: Link yuborilganda videoni tashlash
+# 2. LINK KELGANDA VIDEONI VA TUGMALARNI CHIQARISH
 # ---------------------------------------------------------
 @dp.message(F.text.regexp(r'https?://(?:www\.)?(?:instagram\.com|youtube\.com|youtu\.be)/.+'))
-async def download_normal_video(message: Message):
+async def download_media(message: Message):
     url = message.text.strip()
     status_msg = await message.reply("⚡ Video yuklanmoqda...")
+
     try:
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, get_video_info, url)
         direct_url = info.get('url')
+
         if direct_url:
             await message.reply_video(
                 video=direct_url,
-                caption="💡 <i>Ushbu videoga Reply qilib <b>/round</b>, <b>/audio</b> yoki <b>/cut 00:00 00:10</b> yuborishingiz mumkin!</i>",
+                caption=f"⚡ <b>FlashFeatures</b>\nKerakli amalni tanlang:\n\n<code>{url}</code>",
+                reply_markup=get_action_keyboard(),
                 parse_mode="HTML"
             )
             await status_msg.delete()
@@ -242,7 +97,195 @@ async def download_normal_video(message: Message):
         await status_msg.edit_text("Xatolik: video yopiq profildan yoki havola noto'g'ri.")
 
 # ---------------------------------------------------------
-# 8. Web-server
+# 3. YORDAMCHI: Video faylni Telegramdan tezkor yuklab olish
+# ---------------------------------------------------------
+async def fetch_target_video(callback: CallbackQuery, path: str):
+    if callback.message and callback.message.video:
+        file = await bot.get_file(callback.message.video.file_id)
+        await bot.download_file(file.file_path, path)
+        return True
+    return False
+
+# ---------------------------------------------------------
+# 4. TUGMALAR ISHLOVCHILARI (TEZKOR REJIM)
+# ---------------------------------------------------------
+
+# 4.1. ULTRA TEZ AYLANa VIDEO (SCALE 360 + ULTRAFAST)
+@dp.callback_query(F.data == "round_btn")
+async def process_round(callback: CallbackQuery):
+    await callback.answer("Aylana video tayyorlanmoqda...")
+    uid = callback.from_user.id
+    raw_video = f"raw_round_{uid}.mp4"
+    round_video = f"round_{uid}.mp4"
+
+    try:
+        success = await fetch_target_video(callback, raw_video)
+        if not success:
+            return await callback.message.reply("Video topilmadi.")
+
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', raw_video,
+            '-t', '60',
+            '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=360:360",
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '28',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-threads', '0',
+            round_video
+        ]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+        if os.path.exists(round_video):
+            await callback.message.reply_video_note(video_note=FSInputFile(round_video))
+        else:
+            await callback.message.reply("Aylana video yasashda xatolik yuz berdi.")
+    except Exception as e:
+        await callback.message.reply(f"Xatolik: {e}")
+    finally:
+        for f in [raw_video, round_video]:
+            if os.path.exists(f):
+                os.remove(f)
+
+# 4.2. TEZKOR MP3 AUDIO AJRATISH
+@dp.callback_query(F.data == "audio_btn")
+async def process_audio(callback: CallbackQuery):
+    await callback.answer("Audio ajratilmoqda...")
+    uid = callback.from_user.id
+    raw_video = f"raw_audio_{uid}.mp4"
+    audio_file = f"audio_{uid}.mp3"
+
+    try:
+        success = await fetch_target_video(callback, raw_video)
+        if not success:
+            return await callback.message.reply("Video topilmadi.")
+
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', raw_video,
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-q:a', '4',
+            '-threads', '0',
+            audio_file
+        ]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+        if os.path.exists(audio_file):
+            await callback.message.reply_audio(audio=FSInputFile(audio_file))
+        else:
+            await callback.message.reply("Audioni ajratib bo'lmadi.")
+    except Exception as e:
+        await callback.message.reply(f"Xatolik: {e}")
+    finally:
+        for f in [raw_video, audio_file]:
+            if os.path.exists(f):
+                os.remove(f)
+
+# 4.3. QIRQISH (CUT) — FAST SEEK BILAN TEZ KESISH
+@dp.callback_query(F.data == "cut_btn")
+async def ask_cut_time(callback: CallbackQuery, state: FSMContext):
+    if not callback.message.video:
+        return await callback.answer("Video topilmadi.")
+    
+    await state.update_data(video_file_id=callback.message.video.file_id)
+    await state.set_state(CutState.waiting_for_time)
+    await callback.answer()
+    await callback.message.reply(
+        "✂️ Qirqish vaqtini yuboring:\nFormat: <code>00:05 00:15</code> (boshlanish va tugash)",
+        parse_mode="HTML"
+    )
+
+@dp.message(CutState.waiting_for_time)
+async def process_cut_time(message: Message, state: FSMContext):
+    times = message.text.strip().split()
+    if len(times) != 2:
+        return await message.reply("Noto'g'ri format! Masalan: <code>00:05 00:20</code>", parse_mode="HTML")
+
+    start_time, end_time = times[0], times[1]
+    status_msg = await message.reply(f"✂️ {start_time} dan {end_time} gacha kesilmoqda...")
+
+    data = await state.get_data()
+    file_id = data.get("video_file_id")
+    await state.clear()
+
+    uid = message.from_user.id
+    raw_video = f"raw_cut_{uid}.mp4"
+    cut_video = f"cut_{uid}.mp4"
+
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, raw_video)
+
+        # Fast seek orqali bir zumda qirqish
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-ss', start_time,
+            '-to', end_time,
+            '-i', raw_video,
+            '-c', 'copy',
+            cut_video
+        ]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+        if os.path.exists(cut_video):
+            await message.reply_video(video=FSInputFile(cut_video))
+            await status_msg.delete()
+        else:
+            await status_msg.edit_text("Videoni kesib bo'lmadi. Vaqt oralig'ini tekshiring.")
+    except Exception as e:
+        await status_msg.edit_text(f"Xatolik: {e}")
+    finally:
+        for f in [raw_video, cut_video]:
+            if os.path.exists(f):
+                os.remove(f)
+
+# 4.4. TAVSIF / MATN
+@dp.callback_query(F.data == "text_btn")
+async def process_text(callback: CallbackQuery):
+    await callback.answer("Tavsif olinmoqda...")
+    caption = callback.message.caption or ""
+    urls = [line.strip() for line in caption.split("\n") if line.strip().startswith("http")]
+    
+    if not urls:
+        return await callback.message.reply("Video havolasi topilmadi.")
+
+    try:
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(None, get_video_info, urls[0])
+        desc = info.get("description", "Tavsif mavjud emas.")
+        await callback.message.reply(desc[:4000])
+    except Exception:
+        await callback.message.reply("Tavsifni olib bo'lmadi.")
+
+# 4.5. MUQOVA (THUMBNAIL)
+@dp.callback_query(F.data == "thumb_btn")
+async def process_thumb(callback: CallbackQuery):
+    await callback.answer("Muqova olinmoqda...")
+    caption = callback.message.caption or ""
+    urls = [line.strip() for line in caption.split("\n") if line.strip().startswith("http")]
+
+    if not urls:
+        return await callback.message.reply("Video havolasi topilmadi.")
+
+    try:
+        loop = asyncio.get_running_loop()
+        info = await loop.run_in_executor(None, get_video_info, urls[0])
+        thumb = info.get("thumbnail")
+        if thumb:
+            await callback.message.reply_photo(photo=thumb)
+        else:
+            await callback.message.reply("Muqova topilmadi.")
+    except Exception:
+        await callback.message.reply("Muqovani yuklab bo'lmadi.")
+
+# ---------------------------------------------------------
+# 5. UPTIMEROBOT UCHUN WEB-SERVER
 # ---------------------------------------------------------
 async def health_check(request):
     return web.Response(text="FlashFeatures Bot ishlamoqda!")
@@ -258,7 +301,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("FlashFeatures Bot yangilanishi bilan ishga tushdi...")
+    print("FlashFeatures Bot tezyurar rejimida ishga tushdi...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
