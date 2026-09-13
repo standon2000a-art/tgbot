@@ -37,7 +37,7 @@ ydl_info_opts = {
     'format': 'best',
 }
 
-def get_video_info(url: str):
+def get_media_info(url: str):
     with yt_dlp.YoutubeDL(ydl_info_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -65,39 +65,56 @@ def get_action_keyboard() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     await message.reply(
-        "⚡️ <b>FlashFeatures Bot</b>'ga xush kelibsiz!\n\n"
-        "Menga Instagram yoki YouTube havolasini yuboring. Video yuklangach, uning tagidagi tugmalar orqali barcha amallarni bir zumda bajarasiz!",
+        "⚡️ <b>FlashFeatured Bot</b>'ga xush kelibsiz!\n\n"
+        "Menga <b>Instagram, TikTok, YouTube</b> yoki <b>Pinterest</b> havolasini yuboring. Media yuklangach, tagidagi qulay tugmalar orqali barcha amallarni bajarasiz!",
         parse_mode="HTML"
     )
 
 # ---------------------------------------------------------
-# 2. LINK KELGANDA VIDEONI VA TUGMALARNI CHIQARISH
+# 2. UNIVERSAL LINK USHLAGICH (Instagram, TikTok, YouTube, Pinterest)
 # ---------------------------------------------------------
-@dp.message(F.text.regexp(r'https?://(?:www\.)?(?:instagram\.com|youtube\.com|youtu\.be)/.+'))
+URL_PATTERN = r'https?://(?:www\.)?(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com|vt\.tiktok\.com|pin\.it|pinterest\.com)/.+'
+
+@dp.message(F.text.regexp(URL_PATTERN))
 async def download_media(message: Message):
     url = message.text.strip()
-    status_msg = await message.reply("⚡ Video yuklanmoqda...")
+    status_msg = await message.reply("⚡ Media tayyorlanmoqda...")
 
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_video_info, url)
+        info = await loop.run_in_executor(None, get_media_info, url)
+        
+        # 1-holat: Agar Pinterest'dan rasm bo'lsa
+        ext = info.get('ext')
         direct_url = info.get('url')
+        thumbnail = info.get('thumbnail')
 
+        if ext in ['jpg', 'jpeg', 'png', 'webp'] or (not ext and thumbnail):
+            photo_url = direct_url if ext in ['jpg', 'jpeg', 'png', 'webp'] else thumbnail
+            await message.reply_photo(
+                photo=photo_url,
+                caption="⚡ <b>FlashFeatured</b>\n🖼 Rasm yuklandi!",
+                parse_mode="HTML"
+            )
+            await status_msg.delete()
+            return
+
+        # 2-holat: Video bo'lsa (Instagram, TikTok, YouTube, Pinterest video)
         if direct_url:
             await message.reply_video(
                 video=direct_url,
-                caption=f"⚡ <b>FlashFeatures</b>\nKerakli amalni tanlang:\n\n<code>{url}</code>",
+                caption=f"⚡ <b>FlashFeatured</b>\nKerakli amalni tanlang:\n\n<code>{url}</code>",
                 reply_markup=get_action_keyboard(),
                 parse_mode="HTML"
             )
             await status_msg.delete()
         else:
-            await status_msg.edit_text("Videoni tortib bo'lmadi.")
+            await status_msg.edit_text("Medianing to'g'ridan-to'g'ri havolasini olib bo'lmadi.")
     except Exception:
-        await status_msg.edit_text("Xatolik: video yopiq profildan yoki havola noto'g'ri.")
+        await status_msg.edit_text("Xatolik: havola yopiq, o'chirilgan yoki noto'g'ri formatda.")
 
 # ---------------------------------------------------------
-# 3. YORDAMCHI: Video faylni Telegramdan tezkor yuklab olish
+# 3. YORDAMCHI: Video faylni Telegramdan yuklab olish
 # ---------------------------------------------------------
 async def fetch_target_video(callback: CallbackQuery, path: str):
     if callback.message and callback.message.video:
@@ -107,10 +124,10 @@ async def fetch_target_video(callback: CallbackQuery, path: str):
     return False
 
 # ---------------------------------------------------------
-# 4. TUGMALAR ISHLOVCHILARI (TEZKOR REJIM)
+# 4. TUGMALAR ISHLOVCHILARI (OPTIMAL TEZLIK)
 # ---------------------------------------------------------
 
-# 4.1. ULTRA TEZ AYLANa VIDEO (SCALE 360 + ULTRAFAST)
+# 4.1. AYLANa VIDEO (SCALE 240 + ULTRAFAST — MAKSIMAL TEZLIK)
 @dp.callback_query(F.data == "round_btn")
 async def process_round(callback: CallbackQuery):
     await callback.answer("Aylana video tayyorlanmoqda...")
@@ -127,7 +144,7 @@ async def process_round(callback: CallbackQuery):
             'ffmpeg', '-y',
             '-i', raw_video,
             '-t', '60',
-            '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=360:360",
+            '-vf', "crop='min(iw,ih)':'min(iw,ih)',scale=240:240",
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-crf', '28',
@@ -150,7 +167,7 @@ async def process_round(callback: CallbackQuery):
             if os.path.exists(f):
                 os.remove(f)
 
-# 4.2. TEZKOR MP3 AUDIO AJRATISH
+# 4.2. MP3 AUDIO AJRATISH
 @dp.callback_query(F.data == "audio_btn")
 async def process_audio(callback: CallbackQuery):
     await callback.answer("Audio ajratilmoqda...")
@@ -186,7 +203,7 @@ async def process_audio(callback: CallbackQuery):
             if os.path.exists(f):
                 os.remove(f)
 
-# 4.3. QIRQISH (CUT) — FAST SEEK BILAN TEZ KESISH
+# 4.3. QIRQISH (CUT) — FAST SEEK
 @dp.callback_query(F.data == "cut_btn")
 async def ask_cut_time(callback: CallbackQuery, state: FSMContext):
     if not callback.message.video:
@@ -221,7 +238,6 @@ async def process_cut_time(message: Message, state: FSMContext):
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, raw_video)
 
-        # Fast seek orqali bir zumda qirqish
         ffmpeg_cmd = [
             'ffmpeg', '-y',
             '-ss', start_time,
@@ -257,7 +273,7 @@ async def process_text(callback: CallbackQuery):
 
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_video_info, urls[0])
+        info = await loop.run_in_executor(None, get_media_info, urls[0])
         desc = info.get("description", "Tavsif mavjud emas.")
         await callback.message.reply(desc[:4000])
     except Exception:
@@ -275,7 +291,7 @@ async def process_thumb(callback: CallbackQuery):
 
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_video_info, urls[0])
+        info = await loop.run_in_executor(None, get_media_info, urls[0])
         thumb = info.get("thumbnail")
         if thumb:
             await callback.message.reply_photo(photo=thumb)
@@ -288,7 +304,7 @@ async def process_thumb(callback: CallbackQuery):
 # 5. UPTIMEROBOT UCHUN WEB-SERVER
 # ---------------------------------------------------------
 async def health_check(request):
-    return web.Response(text="FlashFeatures Bot ishlamoqda!")
+    return web.Response(text="FlashFeatured Bot ishlamoqda!")
 
 async def start_web_server():
     app = web.Application()
@@ -301,7 +317,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("FlashFeatures Bot tezyurar rejimida ishga tushdi...")
+    print("FlashFeatured Bot to'liq platformalar bilan ishga tushdi...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
