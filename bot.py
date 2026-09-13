@@ -3,7 +3,9 @@ static_ffmpeg.add_paths()
 
 import asyncio
 import os
+import re
 import subprocess
+import aiohttp
 import yt_dlp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -27,7 +29,6 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Video qirqish holati uchun FSM
 class CutState(StatesGroup):
     waiting_for_time = State()
 
@@ -42,7 +43,6 @@ def get_media_info(url: str):
         return ydl.extract_info(url, download=False)
 
 def get_action_keyboard() -> InlineKeyboardMarkup:
-    """Video tagidagi boshqaruv tugmalari"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -60,6 +60,39 @@ def get_action_keyboard() -> InlineKeyboardMarkup:
     )
 
 # ---------------------------------------------------------
+# Qisqa havolalarni (pin.it, vt.tiktok.com) to'liq havolaga aylantirish
+# ---------------------------------------------------------
+async def resolve_url(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                return str(resp.url)
+    except Exception:
+        return url
+
+# Pinterest sahifasidagi asl rasmni ajratib olish
+async def fetch_pinterest_image(url: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url) as resp:
+                html = await resp.text()
+                # og:image tegini topamiz
+                match = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
+                if match:
+                    # Rasm sifatini original 736x yoki originals ga oshiramiz
+                    img_url = match.group(1).replace('/236x/', '/736x/').replace('/474x/', '/736x/')
+                    return img_url
+    except Exception:
+        pass
+    return None
+
+# ---------------------------------------------------------
 # 1. START
 # ---------------------------------------------------------
 @dp.message(CommandStart())
@@ -71,47 +104,66 @@ async def start_cmd(message: Message):
     )
 
 # ---------------------------------------------------------
-# 2. UNIVERSAL LINK USHLAGICH (Instagram, TikTok, YouTube, Pinterest)
+# 2. UNIVERSAL LINK QABUL QILISH
 # ---------------------------------------------------------
 URL_PATTERN = r'https?://(?:www\.)?(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com|vt\.tiktok\.com|pin\.it|pinterest\.com)/.+'
 
 @dp.message(F.text.regexp(URL_PATTERN))
 async def download_media(message: Message):
-    url = message.text.strip()
+    raw_url = message.text.strip()
     status_msg = await message.reply("⚡ Media tayyorlanmoqda...")
 
     try:
+        # 1. Qisqa havolani asl havolaga o'giramiz
+        url = await resolve_url(raw_url)
         loop = asyncio.get_running_loop()
+
+        # 2. Pinterest rasm tekshiruvi
+        if "pinterest.com" in url or "pin.it" in raw_url:
+            pin_img = await fetch_pinterest_image(url)
+            # Avval video bor-yo'qligini yt-dlp dan bilib ko'ramiz
+            try:
+                info = await loop.run_in_executor(None, get_media_info, url)
+                direct_url = info.get('url')
+                # Agar video bo'lsa
+                if direct_url and info.get('ext') in ['mp4', 'mkv', 'webm']:
+                    await message.reply_video(
+                        video=direct_url,
+                        caption=f"⚡ <b>FlashFeatured</b>\nKerakli amalni tanlang:\n\n<code>{raw_url}</code>",
+                        reply_markup=get_action_keyboard(),
+                        parse_mode="HTML"
+                    )
+                    await status_msg.delete()
+                    return
+            except Exception:
+                pass
+            
+            # Agar video bo'lmasa, rasm sifatida yuboramiz
+            if pin_img:
+                await message.reply_photo(
+                    photo=pin_img,
+                    caption="⚡ <b>FlashFeatured</b>\n🖼 Pinterest rasmi yuklandi!",
+                    parse_mode="HTML"
+                )
+                await status_msg.delete()
+                return
+
+        # 3. Oddiy video (Instagram, TikTok, YouTube)
         info = await loop.run_in_executor(None, get_media_info, url)
-        
-        # 1-holat: Agar Pinterest'dan rasm bo'lsa
-        ext = info.get('ext')
         direct_url = info.get('url')
-        thumbnail = info.get('thumbnail')
 
-        if ext in ['jpg', 'jpeg', 'png', 'webp'] or (not ext and thumbnail):
-            photo_url = direct_url if ext in ['jpg', 'jpeg', 'png', 'webp'] else thumbnail
-            await message.reply_photo(
-                photo=photo_url,
-                caption="⚡ <b>FlashFeatured</b>\n🖼 Rasm yuklandi!",
-                parse_mode="HTML"
-            )
-            await status_msg.delete()
-            return
-
-        # 2-holat: Video bo'lsa (Instagram, TikTok, YouTube, Pinterest video)
         if direct_url:
             await message.reply_video(
                 video=direct_url,
-                caption=f"⚡ <b>FlashFeatured</b>\nKerakli amalni tanlang:\n\n<code>{url}</code>",
+                caption=f"⚡ <b>FlashFeatured</b>\nKerakli amalni tanlang:\n\n<code>{raw_url}</code>",
                 reply_markup=get_action_keyboard(),
                 parse_mode="HTML"
             )
             await status_msg.delete()
         else:
             await status_msg.edit_text("Medianing to'g'ridan-to'g'ri havolasini olib bo'lmadi.")
-    except Exception:
-        await status_msg.edit_text("Xatolik: havola yopiq, o'chirilgan yoki noto'g'ri formatda.")
+    except Exception as e:
+        await status_msg.edit_text(f"Xatolik: havola yopiq yoki noto'g'ri formatda.")
 
 # ---------------------------------------------------------
 # 3. YORDAMCHI: Video faylni Telegramdan yuklab olish
@@ -124,10 +176,9 @@ async def fetch_target_video(callback: CallbackQuery, path: str):
     return False
 
 # ---------------------------------------------------------
-# 4. TUGMALAR ISHLOVCHILARI (OPTIMAL TEZLIK)
+# 4. TUGMALAR (ROUND, AUDIO, CUT, TEXT, THUMB)
 # ---------------------------------------------------------
 
-# 4.1. AYLANa VIDEO (SCALE 240 + ULTRAFAST — MAKSIMAL TEZLIK)
 @dp.callback_query(F.data == "round_btn")
 async def process_round(callback: CallbackQuery):
     await callback.answer("Aylana video tayyorlanmoqda...")
@@ -167,7 +218,6 @@ async def process_round(callback: CallbackQuery):
             if os.path.exists(f):
                 os.remove(f)
 
-# 4.2. MP3 AUDIO AJRATISH
 @dp.callback_query(F.data == "audio_btn")
 async def process_audio(callback: CallbackQuery):
     await callback.answer("Audio ajratilmoqda...")
@@ -203,7 +253,6 @@ async def process_audio(callback: CallbackQuery):
             if os.path.exists(f):
                 os.remove(f)
 
-# 4.3. QIRQISH (CUT) — FAST SEEK
 @dp.callback_query(F.data == "cut_btn")
 async def ask_cut_time(callback: CallbackQuery, state: FSMContext):
     if not callback.message.video:
@@ -261,7 +310,6 @@ async def process_cut_time(message: Message, state: FSMContext):
             if os.path.exists(f):
                 os.remove(f)
 
-# 4.4. TAVSIF / MATN
 @dp.callback_query(F.data == "text_btn")
 async def process_text(callback: CallbackQuery):
     await callback.answer("Tavsif olinmoqda...")
@@ -272,14 +320,14 @@ async def process_text(callback: CallbackQuery):
         return await callback.message.reply("Video havolasi topilmadi.")
 
     try:
+        resolved = await resolve_url(urls[0])
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_media_info, urls[0])
+        info = await loop.run_in_executor(None, get_media_info, resolved)
         desc = info.get("description", "Tavsif mavjud emas.")
         await callback.message.reply(desc[:4000])
     except Exception:
         await callback.message.reply("Tavsifni olib bo'lmadi.")
 
-# 4.5. MUQOVA (THUMBNAIL)
 @dp.callback_query(F.data == "thumb_btn")
 async def process_thumb(callback: CallbackQuery):
     await callback.answer("Muqova olinmoqda...")
@@ -290,8 +338,9 @@ async def process_thumb(callback: CallbackQuery):
         return await callback.message.reply("Video havolasi topilmadi.")
 
     try:
+        resolved = await resolve_url(urls[0])
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_media_info, urls[0])
+        info = await loop.run_in_executor(None, get_media_info, resolved)
         thumb = info.get("thumbnail")
         if thumb:
             await callback.message.reply_photo(photo=thumb)
@@ -301,7 +350,7 @@ async def process_thumb(callback: CallbackQuery):
         await callback.message.reply("Muqovani yuklab bo'lmadi.")
 
 # ---------------------------------------------------------
-# 5. UPTIMEROBOT UCHUN WEB-SERVER
+# 5. UPTIMEROBOT WEB-SERVER
 # ---------------------------------------------------------
 async def health_check(request):
     return web.Response(text="FlashFeatured Bot ishlamoqda!")
@@ -317,7 +366,7 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
-    print("FlashFeatured Bot to'liq platformalar bilan ishga tushdi...")
+    print("FlashFeatured Bot to'liq tayyor...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
